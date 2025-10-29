@@ -16,48 +16,72 @@ try:
 except ImportError:
     genai = None
 
-# Basic app setup
 st.set_page_config(page_title="Threads DOL Finder", layout="wide", page_icon="🧵")
 st.title("🧵 Threads DOL & Profile Vetting — GPT-5 + Gemini 3 Support")
 
-# Runs a specified Apify actor with a payload, returns dataset items
-def run_apify_actor(actor_id, api_key, payload):
+# --- Utility Functions ---
+def threaded(func, *args, **kwargs):
+    res = {}
+    def wrapper():
+        try:
+            res["data"] = func(*args, **kwargs)
+        except Exception as err:
+            res["error"] = str(err)
+    t = threading.Thread(target=wrapper)
+    t.start()
+    t.join()
+    if "error" in res:
+        raise RuntimeError(res["error"])
+    return res.get("data")
+
+def run_apify_actor(actor_id, api_key, payload, timeout_sec=300):
+    # Use schema-aligned payload keys – check actor docs if uncertain!
     run_url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    resp = requests.post(run_url, json=payload, headers=headers, timeout=60)
-    resp.raise_for_status()
-    run_id = resp.json().get("data", {}).get("id")
-    if not run_id:
-        raise RuntimeError("No run ID from Apify")
+    try:
+        resp = requests.post(run_url, json=payload, headers=headers, timeout=60)
+        resp.raise_for_status()
+        run_id = resp.json().get("data", {}).get("id")
+        if not run_id:
+            raise RuntimeError("No run ID from Apify")
 
-    # Poll with timeout for run to complete
-    for _ in range(60):
-        status = requests.get(f"{run_url}/{run_id}", headers=headers).json().get("data", {}).get("status")
-        if status == "SUCCEEDED":
-            break
-        time.sleep(5)
-    else:
+        # Poll run status until complete (SUCCEEDED/FAILED)
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            run_status_resp = requests.get(f"{run_url}/{run_id}", headers=headers)
+            status_json = run_status_resp.json()
+            status = status_json.get("data", {}).get("status")
+            if status == "SUCCEEDED":
+                dataset_id = status_json["data"]["defaultDatasetId"]
+                data_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true"
+                dataset_resp = requests.get(data_url, headers=headers, timeout=60)
+                dataset_resp.raise_for_status()
+                return dataset_resp.json()
+            elif status == "FAILED":
+                log_url = status_json["data"].get("buildOutputUrl")
+                raise RuntimeError(f"Apify run failed: {status_json}. Full log: {log_url}")
+            elif status == "ABORTED":
+                raise RuntimeError("Apify run aborted unexpectedly.")
+            time.sleep(5)
         raise TimeoutError("Apify actor run timed out")
-
-    dataset_id = requests.get(f"{run_url}/{run_id}", headers=headers).json()["data"]["defaultDatasetId"]
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true"
-    dataset_resp = requests.get(url, headers=headers, timeout=60)
-    dataset_resp.raise_for_status()
-    return dataset_resp.json()
+    except Exception as e:
+        st.warning(f"Apify actor error: {str(e)}")
+        return []
 
 @st.cache_data(show_spinner=True)
 def scrape_threads_posts(api_key, keywords, max_items):
     posts = []
+    # Update for expected schemas
     for kw in keywords:
         try:
-            # futurizerush/meta-threads-scraper for search posts
+            # Meta Threads Post Search Actor
             search_posts = run_apify_actor(
                 "futurizerush~meta-threads-scraper",
                 api_key,
-                {"search": kw, "maxItems": max_items, "includeComments": False}
+                {"search": kw, "maxPosts": max_items, "includeComments": False}
             )
-            # curious_coder/threads-scraper for detailed posts
+            # Detailed Threads Post Actor
             detailed_posts = run_apify_actor(
                 "curious_coder~threads-scraper",
                 api_key,
@@ -76,7 +100,7 @@ def scrape_threads_posts(api_key, keywords, max_items):
                     "timestamp": p.get("taken_at")
                 })
             posts.extend(combined)
-            time.sleep(3)  # Gentle pause
+            time.sleep(3)
         except Exception as e:
             st.warning(f"Error scraping '{kw}': {e}")
             continue
@@ -132,23 +156,8 @@ def ai_vet_threads(data, model, provider, api_key, temperature=0.4):
         st.error(f"AI vetting failed: {e}")
         return pd.DataFrame()
 
-def threaded(func, *args):
-    res = {}
-    def wrapper():
-        try:
-            res["data"] = func(*args)
-        except Exception as err:
-            res["error"] = str(err)
-    t = threading.Thread(target=wrapper)
-    t.start()
-    t.join()
-    if "error" in res:
-        raise RuntimeError(res["error"])
-    return res.get("data")
-
-# Sidebar
+# --- UI / Workflow ---
 st.sidebar.header("Setup APIs and Model")
-
 apify_key = st.sidebar.text_input("Apify API Token", type="password")
 provider = st.sidebar.selectbox("AI Provider", ["OpenAI GPT", "Google Gemini"])
 if provider == "OpenAI GPT":
@@ -165,7 +174,7 @@ keyword_input = st.sidebar.text_area("Enter Topics / Keywords (one per line)")
 keywords = [k.strip() for k in keyword_input.splitlines() if k.strip()]
 max_posts = st.sidebar.number_input("Max Posts per Keyword", 10, 200, 50)
 
-# Main buttons & logic
+# Main workflow (use session state for multi-step process)
 if st.button("🚀 Scrape Threads Posts"):
     if not apify_key:
         st.warning("Enter your Apify API token")
